@@ -4136,10 +4136,16 @@ llvm::DILocalVariable *CGDebugInfo::EmitDeclare(const VarDecl *VD,
     Unit = getOrCreateFile(VD->getLocation());
   llvm::DIType *Ty;
   uint64_t XOffset = 0;
+  bool ForceDeref = false;
   if (VD->hasAttr<BlocksAttr>())
     Ty = EmitTypeForVarWithBlocksAttr(VD, &XOffset).WrappedType;
-  else
+  else {
     Ty = getOrCreateType(VD->getType(), Unit);
+    QualType Ty_tmp = VD->getType();
+    if (Ty_tmp->getTypeClass() == Type::Typedef &&
+      cast<TypedefType>(Ty_tmp)->getDecl()->getUnderlyingType()->getTypeClass() == Type::Vector)
+      ForceDeref = true;
+  }
 
   // If there is no debug info for this type then do not emit debug info
   // for this variable.
@@ -4226,6 +4232,9 @@ llvm::DILocalVariable *CGDebugInfo::EmitDeclare(const VarDecl *VD,
       }
     }
   }
+
+  if(ForceDeref)
+    Expr.push_back(llvm::dwarf::DW_OP_deref);
 
   // Clang stores the sret pointer provided by the caller in a static alloca.
   // Use DW_OP_deref to tell the debugger to load the pointer and treat it as
