@@ -2748,21 +2748,71 @@ llvm::DIType *CGDebugInfo::CreateType(const VectorType *Ty,
   llvm::Metadata *Subscript;
   QualType QTy(Ty, 0);
   auto SizeExpr = SizeExprCache.find(QTy);
-  if (SizeExpr != SizeExprCache.end())
+  llvm::DINodeArray SubscriptArray;
+  uint64_t Size;
+  if (SizeExpr != SizeExprCache.end()) {
     Subscript = DBuilder.getOrCreateSubrange(
         SizeExpr->getSecond() /*count*/, nullptr /*lowerBound*/,
         nullptr /*upperBound*/, nullptr /*stride*/);
-  else {
+    SubscriptArray = DBuilder.getOrCreateArray(Subscript);
+    Size = CGM.getContext().getTypeSize(Ty);
+  } else {
+#define DYNAMIC_VECTOR_SIZE
+#ifdef DYNAMIC_VECTOR_SIZE
+    unsigned ElementCount = Ty->getNumElements();
+    printf("ElementCount: %d\n", ElementCount);
+    Ty->getElementType()->dump();
+    unsigned SEW = CGM.getContext().getTypeSize(Ty->getElementType());
+    printf("SEW: %d\n", SEW);
+    bool Fractional = false;
+    unsigned LMUL;
+    unsigned FixedSize = ElementCount * SEW;
+    if (Ty->getElementType() == CGM.getContext().BoolTy) {
+      // Mask type only occupies one vector register.
+      LMUL = 1;
+    } else if (FixedSize < 64) {
+      // In RVV scalable vector types, we encode 64 bits in the fixed part.
+      Fractional = true;
+      LMUL = 64 / FixedSize;
+    } else {
+      LMUL = FixedSize / 64;
+    }
+    // Element count = (VLENB / SEW) x LMUL
+    SmallVector<int64_t, 9> Expr(
+        // The DW_OP_bregx operation has two operands: a register which is
+        // specified by an unsigned LEB128 number, followed by a signed LEB128
+        // offset.
+        {llvm::dwarf::DW_OP_bregx, // Read the contents of a register.
+         4096 + 0xC22,             // RISC-V VLENB CSR register.
+         0, // Offset for DW_OP_bregx. It is dummy here.
+         llvm::dwarf::DW_OP_constu,
+         SEW / 8, // SEW is in bits.
+         llvm::dwarf::DW_OP_div, llvm::dwarf::DW_OP_constu, LMUL});
+    if (Fractional)
+      Expr.push_back(llvm::dwarf::DW_OP_div);
+    else
+      Expr.push_back(llvm::dwarf::DW_OP_mul);
+
+    auto *LowerBound =
+        llvm::ConstantAsMetadata::get(llvm::ConstantInt::getSigned(
+            llvm::Type::getInt64Ty(CGM.getLLVMContext()), 0));
+    auto *UpperBound = DBuilder.createExpression(Expr);
+    Subscript = DBuilder.getOrCreateSubrange(
+        /*count*/ nullptr, LowerBound, UpperBound, /*stride*/ nullptr);
+    SubscriptArray = DBuilder.getOrCreateArray(Subscript);
+    Size = 0;
+#else
     auto *CountNode =
         llvm::ConstantAsMetadata::get(llvm::ConstantInt::getSigned(
             llvm::Type::getInt64Ty(CGM.getLLVMContext()), Count ? Count : -1));
     Subscript = DBuilder.getOrCreateSubrange(
         CountNode /*count*/, nullptr /*lowerBound*/, nullptr /*upperBound*/,
         nullptr /*stride*/);
+    SubscriptArray = DBuilder.getOrCreateArray(Subscript);
+    Size = CGM.getContext().getTypeSize(Ty);
+#endif
   }
-  llvm::DINodeArray SubscriptArray = DBuilder.getOrCreateArray(Subscript);
 
-  uint64_t Size = CGM.getContext().getTypeSize(Ty);
   auto Align = getTypeAlignIfRequired(Ty, CGM.getContext());
 
   return DBuilder.createVectorType(Size, Align, ElementTy, SubscriptArray);
