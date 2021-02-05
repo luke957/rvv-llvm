@@ -2753,12 +2753,60 @@ llvm::DIType *CGDebugInfo::CreateType(const VectorType *Ty,
         SizeExpr->getSecond() /*count*/, nullptr /*lowerBound*/,
         nullptr /*upperBound*/, nullptr /*stride*/);
   else {
+#define RISCV_DYNAMIC_VECTOR_SIZE
+#ifdef RISCV_DYNAMIC_VECTOR_SIZE
+    unsigned ElementCount = Ty->getNumElements();
+    unsigned SEW = CGM.getContext().getTypeSize(Ty->getElementType());
+    bool Fractional = false;
+    unsigned LMUL;
+    unsigned FixedSize = ElementCount * SEW;
+    if (Ty->getElementType() == CGM.getContext().BoolTy) {
+      // Mask type only occupies one vector register.
+      LMUL = 1;
+    } else if (FixedSize < 64) {
+      // In RVV scalable vector types, we encode 64 bits in the fixed part.
+      Fractional = true;
+      LMUL = 64 / FixedSize;
+    } else {
+      LMUL = FixedSize / 64;
+    }
+    // Element count = (VLENB / SEW) x LMUL
+    SmallVector<int64_t, 12> Expr(
+        // The DW_OP_bregx operation has two operands: a register which is
+        // specified by an unsigned LEB128 number, followed by a signed LEB128
+        // offset.
+        {llvm::dwarf::DW_OP_bregx, // Read the contents of a register.
+         4096 + 0xC22,             // RISC-V VLENB CSR register.
+         0, // Offset for DW_OP_bregx. It is dummy here.
+         llvm::dwarf::DW_OP_constu,
+         SEW / 8, // SEW is in bits.
+         llvm::dwarf::DW_OP_div, llvm::dwarf::DW_OP_constu, LMUL});
+    if (Fractional)
+      Expr.push_back(llvm::dwarf::DW_OP_div);
+    else
+      Expr.push_back(llvm::dwarf::DW_OP_mul);
+    Expr.push_back(llvm::dwarf::DW_OP_constu);
+    Expr.push_back(1);
+    Expr.push_back(llvm::dwarf::DW_OP_minus);
+
+    auto *LowerBound =
+        llvm::ConstantAsMetadata::get(llvm::ConstantInt::getSigned(
+            llvm::Type::getInt64Ty(CGM.getLLVMContext()), 0));
+    auto *UpperBound = DBuilder.createExpression(Expr);
+    llvm::Metadata *Subscript = DBuilder.getOrCreateSubrange(
+        /*count*/ nullptr, LowerBound, UpperBound, /*stride*/ nullptr);
+    llvm::DINodeArray SubscriptArray = DBuilder.getOrCreateArray(Subscript);
+
+    auto Align = getTypeAlignIfRequired(Ty, CGM.getContext());
+    return DBuilder.createVectorType(/*Size=*/0, Align, ElementTy, SubscriptArray);
+#else
     auto *CountNode =
         llvm::ConstantAsMetadata::get(llvm::ConstantInt::getSigned(
             llvm::Type::getInt64Ty(CGM.getLLVMContext()), Count ? Count : -1));
     Subscript = DBuilder.getOrCreateSubrange(
         CountNode /*count*/, nullptr /*lowerBound*/, nullptr /*upperBound*/,
         nullptr /*stride*/);
+#endif
   }
   llvm::DINodeArray SubscriptArray = DBuilder.getOrCreateArray(Subscript);
 
@@ -4136,10 +4184,16 @@ llvm::DILocalVariable *CGDebugInfo::EmitDeclare(const VarDecl *VD,
     Unit = getOrCreateFile(VD->getLocation());
   llvm::DIType *Ty;
   uint64_t XOffset = 0;
+  bool NeedDeref = false;
   if (VD->hasAttr<BlocksAttr>())
     Ty = EmitTypeForVarWithBlocksAttr(VD, &XOffset).WrappedType;
-  else
+  else {
     Ty = getOrCreateType(VD->getType(), Unit);
+    QualType Ty_tmp = VD->getType();
+    if (Ty_tmp->getTypeClass() == Type::Typedef &&
+      cast<TypedefType>(Ty_tmp)->getDecl()->getUnderlyingType()->getTypeClass() == Type::Vector)
+      NeedDeref = true;
+  }
 
   // If there is no debug info for this type then do not emit debug info
   // for this variable.
@@ -4226,6 +4280,9 @@ llvm::DILocalVariable *CGDebugInfo::EmitDeclare(const VarDecl *VD,
       }
     }
   }
+
+  if(NeedDeref)
+    Expr.push_back(llvm::dwarf::DW_OP_deref);
 
   // Clang stores the sret pointer provided by the caller in a static alloca.
   // Use DW_OP_deref to tell the debugger to load the pointer and treat it as
